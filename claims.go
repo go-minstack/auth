@@ -7,6 +7,7 @@ type Claims struct {
 	Subject string
 	Name    string
 	Roles   []string
+	Flatten map[string]any // flattened into JWT top-level claims when signing
 }
 
 const claimsKey = "x-claims"

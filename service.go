@@ -21,11 +21,6 @@ type JwtService struct {
 	log        *slog.Logger
 }
 
-type jwtClaims struct {
-	Name  string   `json:"name,omitempty"`
-	Roles []string `json:"roles,omitempty"`
-	jwt.RegisteredClaims
-}
 
 // loadKeys reads environment variables and populates the service's key fields.
 // Priority:
@@ -82,24 +77,30 @@ func (s *JwtService) loadKeys(ctx context.Context) error {
 
 // Sign creates a signed JWT for the given claims with the specified expiry.
 // Requires MINSTACK_JWT_PRIVATE_KEY (RSA) or MINSTACK_JWT_SECRET (HMAC).
+// Fields in Claims.Flatten are merged at the top level of the JWT payload.
 func (s *JwtService) Sign(claims Claims, expiry time.Duration) (string, error) {
-	jc := jwtClaims{
-		Name:  claims.Name,
-		Roles: claims.Roles,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   claims.Subject,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
+	mc := jwt.MapClaims{
+		"sub": claims.Subject,
+		"iat": jwt.NewNumericDate(time.Now()),
+		"exp": jwt.NewNumericDate(time.Now().Add(expiry)),
+	}
+	if claims.Name != "" {
+		mc["name"] = claims.Name
+	}
+	if len(claims.Roles) > 0 {
+		mc["roles"] = claims.Roles
+	}
+	for k, v := range claims.Flatten {
+		mc[k] = v
 	}
 
 	if s.privateKey != nil {
-		token := jwt.NewWithClaims(jwt.SigningMethodRS256, jc)
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, mc)
 		return token.SignedString(s.privateKey)
 	}
 
 	if len(s.secret) > 0 {
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jc)
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, mc)
 		return token.SignedString(s.secret)
 	}
 
@@ -107,6 +108,8 @@ func (s *JwtService) Sign(claims Claims, expiry time.Duration) (string, error) {
 }
 
 // Validate parses and validates a JWT string, returning the extracted Claims.
+// Standard fields (sub, name, roles) are mapped to typed fields; all other
+// non-registered claims are returned in Claims.Flatten.
 func (s *JwtService) Validate(tokenStr string) (*Claims, error) {
 	var keyFunc jwt.Keyfunc
 
@@ -128,19 +131,46 @@ func (s *JwtService) Validate(tokenStr string) (*Claims, error) {
 		return nil, errors.New("no verification key available")
 	}
 
-	token, err := jwt.ParseWithClaims(tokenStr, &jwtClaims{}, keyFunc)
+	token, err := jwt.ParseWithClaims(tokenStr, jwt.MapClaims{}, keyFunc)
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	jc, ok := token.Claims.(*jwtClaims)
+	mc, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
 		return nil, errors.New("invalid token claims")
 	}
 
-	return &Claims{
-		Subject: jc.RegisteredClaims.Subject,
-		Name:    jc.Name,
-		Roles:   jc.Roles,
-	}, nil
+	claims := &Claims{}
+
+	if sub, ok := mc["sub"].(string); ok {
+		claims.Subject = sub
+	}
+	if name, ok := mc["name"].(string); ok {
+		claims.Name = name
+	}
+	if rawRoles, ok := mc["roles"].([]any); ok {
+		for _, r := range rawRoles {
+			if s, ok := r.(string); ok {
+				claims.Roles = append(claims.Roles, s)
+			}
+		}
+	}
+
+	// Reserved JWT claim names — excluded from Flatten
+	reserved := map[string]bool{
+		"sub": true, "iss": true, "aud": true,
+		"exp": true, "nbf": true, "iat": true, "jti": true,
+		"name": true, "roles": true,
+	}
+	for k, v := range mc {
+		if !reserved[k] {
+			if claims.Flatten == nil {
+				claims.Flatten = make(map[string]any)
+			}
+			claims.Flatten[k] = v
+		}
+	}
+
+	return claims, nil
 }
